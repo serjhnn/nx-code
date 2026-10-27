@@ -141,9 +141,9 @@ LLMs have a limited context window, so the agent must manage it:
 ## 3. Workflow — steps the agent follows
 
 ```
-Understand -> Explore -> Plan -> Ask -> Implement -> Verify -> Review -> Report
-                ^                             |          |
-                +-------- fix & retry <-------+----------+
+Understand ─► Explore ─► Plan ─► Ask ─► Implement ─► Verify ─► Review ─► Report
+                 ▲                            │         │
+                 └──────────── fix & retry ◄──┴─────────┘
 ```
 
 ### Step 1 — Understand the task
