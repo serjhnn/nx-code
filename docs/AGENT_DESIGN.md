@@ -82,7 +82,7 @@ The system prompt defines who the agent is and how it behaves. It contains:
 - **Environment** — working directory, OS, shell, date, git branch.
 - **Project instructions** — contents of a file like `AGENTS.md` / `NX.md`
   (build and test commands, code style).
-- **Behaviour rules** — the workflow and restrictions from sections 3–9.
+- **Behaviour rules** — the workflow and restrictions from sections 4–10.
 - **Tool descriptions** — what each tool does and when to use it.
 
 ### 2.3 Tool definitions
@@ -138,7 +138,132 @@ LLMs have a limited context window, so the agent must manage it:
 
 ---
 
-## 3. Workflow — steps the agent follows
+## 3. LLM backends (hybrid)
+
+nx-code uses two models with different jobs:
+
+- **Planner (cloud)** — Claude via the Anthropic API (default model
+  `claude-opus-5-5`). Understands the task, explores the code, writes the plan,
+  and reviews the result. Few calls, high quality.
+- **Coder (local)** — a small model running on the device, e.g. Qwen2.5-Coder
+  or Qwen3 (3B–7B, 4-bit) via llama.cpp. Writes the code for one plan step at a
+  time. Many calls, free, private, works offline.
+
+```
+            +----------------------+
+  task ---->|   Planner (cloud)    |----> plan (steps)
+            +----------------------+          |
+                       ^                      v
+                       |           +----------------------+
+             escalate  +-----------|    Coder (local)     |----> edits
+             on failure            +----------------------+
+                                              |
+                                              v
+                                     tests / review (cloud)
+```
+
+### 3.1 Common interface
+
+Both models sit behind the same interface, so the agent loop doesn't care which
+one it is talking to:
+
+```
+class LLMBackend:
+    def chat(messages, tools=None, max_tokens=...) -> Response
+    # Response: text, tool_calls, stop_reason, usage
+```
+
+Implementations:
+
+- `AnthropicBackend` — uses the official Anthropic SDK.
+- `LlamaCppBackend` — talks to a local `llama-server` over HTTP (or uses
+  bindings directly on the device).
+- `MockBackend` — returns scripted responses, for tests.
+
+Each backend converts nx-code's internal message and tool format to and from its
+provider's format.
+
+### 3.2 Who does what
+
+- **Understand and explore** → cloud planner.
+- **Plan** → cloud planner.
+- **Ask the user** → cloud planner decides when.
+- **Implement one step** → local coder.
+- **Run tests and checks** → no LLM, the harness runs them.
+- **Fix a failing test** → local coder first, escalate to cloud if stuck.
+- **Review the final diff** → cloud planner.
+- **Summarize old history (compaction)** → local coder.
+
+### 3.3 Hand-off: plan → coder
+
+The planner returns a structured plan (JSON, using structured outputs). Each
+step is small and self-contained, so a small model can do it with little
+context:
+
+```json
+{
+  "steps": [
+    {
+      "id": 1,
+      "goal": "Add a --verbose flag to the CLI parser",
+      "files": ["src/cli.py"],
+      "context": "Flags are defined with argparse in build_parser().",
+      "done_when": "python -m pytest tests/test_cli.py passes"
+    }
+  ]
+}
+```
+
+For each step the coder receives only: the step, the listed files, and short
+style notes from the project instructions. It gets a small toolset —
+`read_file`, `edit_file`, `write_file` — and returns edits.
+
+### 3.4 Escalation to the cloud
+
+The step goes back to the planner when:
+
+- tests still fail after N attempts (e.g. 2),
+- the coder keeps producing invalid tool calls or broken output,
+- the step turns out to touch more files than planned.
+
+The planner can then fix the step itself, or split it into smaller steps and
+hand them back to the coder.
+
+### 3.5 Practical notes
+
+- **Small context** — local models get 4k–8k tokens on a phone, so each step
+  must include only the code it needs.
+- **Tool calling** — small models are weaker at it. Keep tool schemas simple,
+  validate every call, and on error retry with the error message. llama.cpp can
+  constrain output to a JSON schema (grammars), which helps a lot.
+- **Cost** — keep the planner's system prompt and tools stable so prompt
+  caching works; the planner is called only a few times per task.
+- **Privacy** — the planner sends code to the cloud. Allow excluding files
+  (e.g. secrets, `.env`) from anything sent to the API.
+- **Offline mode** — with no network, the local model does everything, with
+  lower quality.
+- **API key** — read from an environment variable, never stored in the repo.
+
+### 3.6 Configuration example
+
+```json
+{
+  "planner": {
+    "provider": "anthropic",
+    "model": "claude-opus-5-5"
+  },
+  "coder": {
+    "provider": "llamacpp",
+    "url": "http://localhost:8080",
+    "model": "qwen2.5-coder-3b-instruct-q4_k_m.gguf"
+  },
+  "escalate_after_failures": 2
+}
+```
+
+---
+
+## 4. Workflow — steps the agent follows
 
 ```
 Understand ─► Explore ─► Plan ─► Ask ─► Implement ─► Verify ─► Review ─► Report
@@ -161,11 +286,11 @@ Understand ─► Explore ─► Plan ─► Ask ─► Implement ─► Verify 
 
 ### Step 3 — Plan
 
-See section 4.
+See section 5.
 
 ### Step 4 — Ask questions if blocked
 
-See section 5.
+See section 6.
 
 ### Step 5 — Implement
 
@@ -176,11 +301,11 @@ See section 5.
 
 ### Step 6 — Verify
 
-See section 7.
+See section 8.
 
 ### Step 7 — Review own work
 
-See section 8.
+See section 9.
 
 ### Step 8 — Report
 
@@ -190,7 +315,7 @@ See section 8.
 
 ---
 
-## 4. Planning
+## 5. Planning
 
 For anything beyond a trivial change, the agent writes a plan before editing.
 
@@ -217,7 +342,7 @@ proposes a plan, then waits for user approval before writing any code.
 
 ---
 
-## 5. Asking questions
+## 6. Asking questions
 
 The agent should **act when it has enough information** and **ask only when
 truly blocked**.
@@ -245,7 +370,7 @@ Good questions are specific and offer options:
 
 ---
 
-## 6. Permissions and restrictions
+## 7. Permissions and restrictions
 
 ### 6.1 Permission levels
 
@@ -315,7 +440,7 @@ Rules are configurable, e.g. in `.nx/settings.json`:
 
 ---
 
-## 7. Testing the code
+## 8. Testing the code
 
 After making changes, the agent verifies them before reporting success.
 
@@ -333,7 +458,7 @@ After making changes, the agent verifies them before reporting success.
 
 ---
 
-## 8. Looking for issues (self-review)
+## 9. Looking for issues (self-review)
 
 Before reporting, the agent reviews its own diff (`git diff`) like a strict
 reviewer:
@@ -351,7 +476,7 @@ can catch issues the working agent missed.
 
 ---
 
-## 9. Git workflow
+## 10. Git workflow
 
 - Check `git status` before starting; don't overwrite the user's uncommitted
   work.
@@ -362,9 +487,10 @@ can catch issues the working agent missed.
 
 ---
 
-## 10. Suggested build order
+## 11. Suggested build order
 
-1. **Minimal loop** — LLM client, `read_file`, `run_shell`, simple terminal UI.
+1. **Minimal loop** — `LLMBackend` interface with the Anthropic backend,
+   `read_file`, `run_shell`, simple terminal UI.
 2. **Editing tools** — `edit_file`, `write_file`, `grep`, `glob`.
 3. **Permission gate** — allow / ask / deny with user prompts.
 4. **System prompt** — load project instructions (`AGENTS.md` / `NX.md`).
@@ -372,4 +498,5 @@ can catch issues the working agent missed.
 6. **Context management** — output truncation and history compaction.
 7. **Testing & review** — detect test commands, self-review pass.
 8. **Config & modes** — settings file, permission modes, plan mode.
-9. **Extras** — sub-agents, MCP/plugin tools, session save/resume.
+9. **Hybrid backends** — llama.cpp backend, planner/coder split, escalation.
+10. **Extras** — sub-agents, MCP/plugin tools, session save/resume.
